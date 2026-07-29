@@ -9,3 +9,8 @@ build/
 .ruff_cache/
 .mypy_cache/
 .idea
+
+# Local-only context (never part of the public repo)
+CLAUDE.local.md
+AGENTS.local.md
+
