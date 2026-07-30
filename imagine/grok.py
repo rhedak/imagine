@@ -23,6 +23,7 @@ from .reference import Reference
 
 API_BASE = "https://api.x.ai/v1"
 EDIT_PATH = "/images/edits"
+GENERATIONS_PATH = "/images/generations"
 MAX_IMAGES = 3
 DEFAULT_MODEL = "grok-imagine-image-quality"
 
@@ -104,20 +105,62 @@ def generate(
     aspect_ratio: str | None = "auto",
     resolution: str | None = "2k",
 ) -> list[GeneratedImage]:
-    """Call /v1/images/edits with up to MAX_IMAGES reference images.
+    """Call /v1/images/edits (with references) or /v1/images/generations (text-only).
 
     resolution defaults to "2k" (vs. the API's own "1k" default) for the
-    highest quality this model offers. At least one reference image is
-    required -- xAI's edits endpoint has no bare text-to-image mode; use
-    /v1/images/generations (not wrapped here) for that.
+    highest quality this model offers.
     """
     if not prompt.strip():
         raise GrokError("prompt must be non-empty")
-    refs = list(references)
-    if not refs:
-        raise GrokError("at least one reference image is required (xAI's edits endpoint has no text-only mode)")
-    used = refs[:MAX_IMAGES]
 
+    refs = list(references)
+    if refs:
+        return _generate_edits(prompt=prompt, references=refs, model=model, n=n, aspect_ratio=aspect_ratio, resolution=resolution)
+    return _generate_text_to_image(prompt=prompt, model=model, n=n, aspect_ratio=aspect_ratio, resolution=resolution)
+
+
+def _parse_response(raw: dict) -> tuple[list[GeneratedImage], float | None]:
+    data = raw.get("data")
+    if not isinstance(data, list) or not data:
+        raise GrokError(f"response missing data[]: {raw!r}"[:800])
+    usage = raw.get("usage") if isinstance(raw.get("usage"), dict) else {}
+    ticks = usage.get("cost_in_usd_ticks")
+    cost_usd = ticks / _TICKS_PER_USD if isinstance(ticks, int) else None
+    images: list[GeneratedImage] = []
+    for i, item in enumerate(data):
+        if not isinstance(item, dict):
+            raise GrokError(f"data[{i}] is not an object")
+        b64 = item.get("b64_json")
+        url = item.get("url")
+        if b64:
+            image_bytes = base64.b64decode(b64)
+        elif url:
+            image_bytes = _http_get_bytes(url)
+        else:
+            raise GrokError(f"result {i} has neither b64_json nor url")
+        images.append(
+            GeneratedImage(
+                index=i,
+                image_bytes=image_bytes,
+                mime_type=item.get("mime_type") or "image/png",
+                cost_usd=cost_usd,
+            )
+        )
+    return images, cost_usd
+
+
+def _generate_edits(
+    *,
+    prompt: str,
+    references: list[Reference],
+    model: str = DEFAULT_MODEL,
+    n: int = 1,
+    aspect_ratio: str | None = "auto",
+    resolution: str | None = "2k",
+) -> list[GeneratedImage]:
+    if not references:
+        raise GrokError("edits endpoint requires at least one reference image")
+    used = references[:MAX_IMAGES]
     images_payload = [{"url": _file_to_data_uri(r.path)} for r in used]
     payload: dict = {"model": model, "prompt": prompt, "n": n, "response_format": "b64_json"}
     if len(images_payload) == 1:
@@ -128,34 +171,24 @@ def generate(
         payload["aspect_ratio"] = aspect_ratio
     if resolution:
         payload["resolution"] = resolution
-
     raw = _http_post_json(EDIT_PATH, payload)
-    data = raw.get("data")
-    if not isinstance(data, list) or not data:
-        raise GrokError(f"edit response missing data[]: {raw!r}"[:800])
+    images, _ = _parse_response(raw)
+    return images
 
-    usage = raw.get("usage") if isinstance(raw.get("usage"), dict) else {}
-    ticks = usage.get("cost_in_usd_ticks")
-    cost_usd = ticks / _TICKS_PER_USD if isinstance(ticks, int) else None
 
-    images: list[GeneratedImage] = []
-    for i, item in enumerate(data):
-        if not isinstance(item, dict):
-            raise GrokError(f"edit data[{i}] is not an object")
-        b64 = item.get("b64_json")
-        url = item.get("url")
-        if b64:
-            image_bytes = base64.b64decode(b64)
-        elif url:
-            image_bytes = _http_get_bytes(url)
-        else:
-            raise GrokError(f"edit result {i} has neither b64_json nor url")
-        images.append(
-            GeneratedImage(
-                index=i,
-                image_bytes=image_bytes,
-                mime_type=item.get("mime_type") or "image/png",
-                cost_usd=cost_usd,
-            )
-        )
+def _generate_text_to_image(
+    *,
+    prompt: str,
+    model: str = DEFAULT_MODEL,
+    n: int = 1,
+    aspect_ratio: str | None = "auto",
+    resolution: str | None = "2k",
+) -> list[GeneratedImage]:
+    payload: dict = {"model": model, "prompt": prompt, "n": n, "response_format": "b64_json"}
+    if aspect_ratio:
+        payload["aspect_ratio"] = aspect_ratio
+    if resolution:
+        payload["resolution"] = resolution
+    raw = _http_post_json(GENERATIONS_PATH, payload)
+    images, _ = _parse_response(raw)
     return images
